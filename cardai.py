@@ -1,6 +1,7 @@
 import asyncio
 import logging
 import os
+import re
 
 import discord
 from discord.ext import commands
@@ -13,56 +14,78 @@ DEAL_CHANNEL_ID = 1556484507366850652
 
 SCAN_INTERVAL = 120
 REGULAR_DELAY = 600
+MIN_DISCOUNT = 20
 
 FANATICS_URL = "https://www.fanaticscollect.com/vault-marketplace?type=FIXED"
 
-logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s %(levelname)s %(message)s",
+)
 
 intents = discord.Intents.default()
 bot = commands.Bot(command_prefix="!", intents=intents)
 
 scanner_task = None
-test_started = False
+seen_urls = set()
 
 
-async def send_startup_test():
-    global test_started
+def parse_prices(text):
+    listing_price = None
+    guide_price = None
 
-    if test_started:
-        return
+    listing_match = re.search(
+        r"(?:Good Deal|Great Deal)\s*\$([\d,]+(?:\.\d{2})?)",
+        text,
+        re.IGNORECASE,
+    )
 
-    test_started = True
+    guide_match = re.search(
+        r"Guide Price by Card Ladder.{0,200}?\$([\d,]+(?:\.\d{2})?)",
+        text,
+        re.IGNORECASE | re.DOTALL,
+    )
 
+    if listing_match:
+        listing_price = float(listing_match.group(1).replace(",", ""))
+
+    if guide_match:
+        guide_price = float(guide_match.group(1).replace(",", ""))
+
+    return listing_price, guide_price
+
+
+async def send_deal(title, price, guide, discount, url):
     pro_channel = bot.get_channel(PRO_CHANNEL_ID)
     deal_channel = bot.get_channel(DEAL_CHANNEL_ID)
 
-    if pro_channel is None:
-        logging.error("Pro channel not found. Check channel ID and bot access.")
-        return
-
-    if deal_channel is None:
-        logging.error("Regular channel not found. Check channel ID and bot access.")
+    if pro_channel is None or deal_channel is None:
+        logging.error("A Discord channel could not be found.")
         return
 
     message = (
-        "**CardAI System Test**\n"
-        "Discord delivery test only. This is not a deal alert."
+        "**CardAI Deal Alert**\n"
+        f"**Card:** {title}\n"
+        f"**Listing price:** ${price:,.2f}\n"
+        f"**Guide price:** ${guide:,.2f}\n"
+        f"**Below guide:** {discount:.1f}%\n"
+        f"[View Listing]({url})"
     )
 
     try:
         await pro_channel.send(message)
-        logging.info("Test message sent to Pro channel.")
+        logging.info("Deal sent to Pro channel: %s", title)
     except discord.DiscordException:
-        logging.exception("Failed to send test message to Pro channel.")
+        logging.exception("Could not send deal to Pro channel.")
         return
 
     await asyncio.sleep(REGULAR_DELAY)
 
     try:
         await deal_channel.send(message)
-        logging.info("Test message sent to regular channel after 10 minutes.")
+        logging.info("Deal sent to regular channel after 10 minutes.")
     except discord.DiscordException:
-        logging.exception("Failed to send test message to regular channel.")
+        logging.exception("Could not send deal to regular channel.")
 
 
 async def scan_fanatics():
@@ -90,23 +113,80 @@ async def scan_fanatics():
                 }))"""
             )
 
-            pokemon_links = [
-                item for item in links
-                if "pokemon" in item["text"].lower()
-                and item["href"].startswith("https://")
-            ]
+            candidates = []
+            for item in links:
+                href = item["href"]
+                title = item["text"]
+
+                if (
+                    "pokemon" in title.lower()
+                    and href.startswith("https://")
+                    and "fanaticscollect.com" in href
+                    and href not in seen_urls
+                ):
+                    if not any(x["href"] == href for x in candidates):
+                        candidates.append(item)
 
             logging.info(
-                "Fanatics loaded. Pokemon links found: %s",
-                len(pokemon_links),
+                "Fanatics loaded. Pokemon candidates: %s",
+                len(candidates),
             )
 
-            for item in pokemon_links[:10]:
-                logging.info(
-                    "Listing candidate: %s | %s",
-                    item["text"][:100],
-                    item["href"],
-                )
+            for item in candidates[:10]:
+                detail_page = await browser.new_page()
+
+                try:
+                    detail_response = await detail_page.goto(
+                        item["href"],
+                        wait_until="domcontentloaded",
+                        timeout=45000,
+                    )
+
+                    if (
+                        detail_response is None
+                        or detail_response.status >= 400
+                    ):
+                        continue
+
+                    await detail_page.wait_for_timeout(2000)
+                    text = await detail_page.locator("body").inner_text()
+
+                    title = (await detail_page.title()).strip()
+                    price, guide = parse_prices(text)
+
+                    if price is None or guide is None or guide <= 0:
+                        logging.info(
+                            "Could not verify prices for: %s",
+                            title,
+                        )
+                        continue
+
+                    discount = ((guide - price) / guide) * 100
+                    seen_urls.add(item["href"])
+
+                    logging.info(
+                        "Checked %s: price=$%.2f guide=$%.2f discount=%.1f%%",
+                        title,
+                        price,
+                        guide,
+                        discount,
+                    )
+
+                    if discount >= MIN_DISCOUNT:
+                        asyncio.create_task(
+                            send_deal(
+                                title,
+                                price,
+                                guide,
+                                discount,
+                                item["href"],
+                            )
+                        )
+
+                except Exception:
+                    logging.exception("Could not check a listing.")
+                finally:
+                    await detail_page.close()
 
         finally:
             await browser.close()
@@ -117,6 +197,7 @@ async def scanner_loop():
 
     while not bot.is_closed():
         try:
+            logging.info("Scanning Fanatics...")
             await scan_fanatics()
         except Exception:
             logging.exception("Scanner error.")
@@ -129,22 +210,27 @@ async def on_ready():
     global scanner_task
 
     logging.info("CardAI is online as %s", bot.user)
-    logging.info("Scanner interval: %s seconds", SCAN_INTERVAL)
+    logging.info("Scan interval: %s seconds", SCAN_INTERVAL)
+    logging.info("Minimum discount: %s%%", MIN_DISCOUNT)
+    logging.info("Regular channel delay: %s seconds", REGULAR_DELAY)
 
     if scanner_task is None or scanner_task.done():
         scanner_task = asyncio.create_task(scanner_loop())
 
-    asyncio.create_task(send_startup_test())
-
 
 @bot.command()
 async def status(ctx):
-    await ctx.send("CardAI is online. Fanatics scan interval: 120 seconds.")
+    await ctx.send(
+        "CardAI is online. Scans every 2 minutes. "
+        "Minimum discount: 20 percent."
+    )
 
 
 async def main():
     if not TOKEN:
-        raise RuntimeError("Missing DISCORD_TOKEN environment variable.")
+        raise RuntimeError(
+            "Missing DISCORD_TOKEN environment variable."
+        )
 
     async with bot:
         await bot.start(TOKEN)
