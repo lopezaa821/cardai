@@ -7,7 +7,7 @@ from discord.ext import commands
 from playwright.async_api import async_playwright
 
 TOKEN = os.getenv("DISCORD_TOKEN")
-SCAN_INTERVAL = 30
+SCAN_INTERVAL = 120
 FANATICS_URL = "https://www.fanaticscollect.com/vault-marketplace?type=FIXED"
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
