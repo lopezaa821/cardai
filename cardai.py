@@ -1,5 +1,3 @@
-cat ~/Desktop/cardai.py
-
 import asyncio
 import logging
 import os
